@@ -1,14 +1,15 @@
 //! Watchdog peripherals
 
+// TODO: implement IWDG2
 use crate::{
     hal::watchdog::{Watchdog, WatchdogEnable},
-    pac::{DBGMCU as DBG, IWDG},
+    pac::{WWDG1 as DBG, IWDG1},
     time::MilliSeconds,
 };
 
 /// Wraps the Independent Watchdog (IWDG) peripheral
 pub struct IndependentWatchdog {
-    iwdg: IWDG,
+    iwdg: IWDG1,
 }
 
 const LSI_KHZ: u32 = 40;

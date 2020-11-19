@@ -1,26 +1,28 @@
 [package]
-authors = ["Jorge Aparicio <jorge@japaric.io>", "Daniel Egger <daniel@eggers-club.de>"]
+authors = ["Maxime Borges <contact@maximeborg.es>", "Jorge Aparicio <jorge@japaric.io>", "Daniel Egger <daniel@eggers-club.de>"]
 categories = ["embedded", "hardware-support", "no-std"]
-description = "HAL for the STM32F1xx family of microcontrollers"
+description = "HAL for the STM32MP1xx family of microcontrollers"
 keywords = ["arm", "cortex-m", "stm32", "hal"]
 license = "MIT OR Apache-2.0"
-name = "stm32f1xx-hal"
-repository = "https://github.com/stm32-rs/stm32f1xx-hal"
-documentation = "https://docs.rs/stm32f1xx-hal"
+name = "stm32mp1xx-hal"
+repository = "https://github.com/stm32-rs/stm32mp1xx-hal"
+documentation = "https://docs.rs/stm32mp1xx-hal"
 readme = "README.md"
 edition = "2018"
 version = "0.7.0"
 
 [package.metadata.docs.rs]
-features = ["stm32f103", "rt", "stm32-usbd"]
+features = ["stm32mp157", "rt", "stm32-usbd"]
 default-target = "x86_64-unknown-linux-gnu"
 
 [dependencies]
-cortex-m = "0.6.0"
+cortex-m = "0.6.4"
+cortex-m-rt = "0.6.13"
 nb = "0.1.2"
-cortex-m-rt = "0.6.8"
-stm32f1 = "0.11.0"
 embedded-dma = "0.1.2"
+
+[dependencies.stm32mp1]
+path = "../stm32-rs/stm32mp1"
 
 [dependencies.void]
 default-features = false
@@ -43,7 +45,7 @@ optional = true
 panic-halt = "0.2.0"
 panic-semihosting = "0.5.2"
 panic-itm = "0.4.1"
-cortex-m-rtfm = "0.5"
+cortex-m-rtfm = "0.5.3"
 cortex-m-semihosting = "0.3.3"
 heapless = "0.4.3"
 m = "0.1.1"
@@ -75,21 +77,8 @@ version = "1.0.90"
 [features]
 device-selected = []
 doc = []
-rt = ["stm32f1/rt"]
-stm32f100 = ["stm32f1/stm32f100", "device-selected"]
-stm32f101 = ["stm32f1/stm32f101", "device-selected"]
-stm32f103 = ["stm32f1/stm32f103", "device-selected"]
-stm32f105 = ["stm32f1/stm32f107", "device-selected", "connectivity"]
-stm32f107 = ["stm32f1/stm32f107", "device-selected", "connectivity"]
-
-# Devices with 64 or 128 Kb ROM
-medium = []
-# Devices with 256 or 512 Kb ROM
-high = ["medium"]
-# Devices with 768 Kb ROM or more
-xl = ["high"]
-# Connectivity line devices (`stm32f105xx` and `stm32f107xx`)
-connectivity = ["medium"]
+rt = ["stm32mp1/rt"]
+stm32mp157 = ["stm32mp1/stm32mp157", "device-selected"]
 
 [profile.dev]
 incremental = false
@@ -101,33 +90,5 @@ debug = true
 lto = true
 
 [[example]]
-name = "usb_serial"
-required-features = ["rt", "stm32-usbd"]
-
-[[example]]
-name = "usb_serial_interrupt"
-required-features = ["rt", "stm32-usbd"]
-
-[[example]]
-name = "usb_serial_rtfm"
-required-features = ["rt", "stm32-usbd"]
-
-[[example]]
-name = "blinky_timer_irq"
-required-features = ["rt"]
-
-[[example]]
-name = "blinky_rtcalarm_irq"
-required-features = ["rt"]
-
-[[example]]
-name = "qei"
-required-features = ["medium"]
-
-[[example]]
-name = "timer-interrupt-rtfm"
-required-features = ["rt", "medium"]
-
-[[example]]
-name = "exti"
-required-features = ["rt"]
+name = "blinky"
+required-features = ["rt", "stm32mp157"]

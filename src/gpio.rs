@@ -4,20 +4,17 @@
 //! `gpioa`, `gpiob`... modules. To get access to the pins, you first need to convert them into a
 //! HAL designed struct from the `pac` struct using the [split](trait.GpioExt.html#tymethod.split) function.
 //! ```rust
-//! // Acquire the GPIOC peripheral
+//! // Acquire the GPIOA peripheral
 //! // NOTE: `dp` is the device peripherals from the `PAC` crate
-//! let mut gpioa = dp.GPIOA.split(&mut rcc.apb2);
+//! let mut gpioa = dp.GPIOA.split();
 //! ```
 //!
-//! See the documentation for [rcc::APB2](../rcc/struct.APB2.html) for details about the input parameter to
-//! `split`.
-//!
-//! This gives you a struct containing two control registers `crl` and `crh`, and all the pins
-//! `px0..px15`. These structs are what you use to interract with the pins to change their modes,
-//! or their inputs or outputs. For example, to set `pa5` high, you would call
+//! This gives you a struct containing all the pins `px0..px15`. These structs are what you use to
+//! interract with the pins to change their modes, or their inputs or outputs.
+//! For example, to set `pa5` high, you would call
 //!
 //! ```rust
-//! let output = gpioa.pa5.into_push_pull_output(&mut gpioa.crl);
+//! let output = gpioa.pa5.into_push_pull_output();
 //! output.set_high();
 //! ```
 //!
@@ -56,11 +53,6 @@
 //! To make a pin dynamic, use the `into_dynamic` function, and then use the `make_<mode>` functions to
 //! change the mode
 //!
-//! ## Accessing PA15, PB3, and PB14
-//!
-//! These pins are used by the JTAG peripheral by default. To use them in your program, you need to
-//! disable that peripheral. This is done using the [afio::MAPR::disable_jtag](../afio/struct.MAPR.html#method.disable_jtag) function
-//!
 //! # Interfacing with v1 traits
 //!
 //! `embedded-hal` has two versions of the digital traits, `v2` which is used by this crate and
@@ -70,42 +62,22 @@
 //! This is done using `embedded-hal::digital::v1_compat::OldOutputPin`. For example:
 //!
 //! ```rust
-//! let nss = gpioa.pa4.into_push_pull_output(&mut gpioa.crl);
+//! use mfrc522::Mfrc522;
+//! let nss = gpioa.pa4.into_push_pull_output();
 //! let mut mfrc522 = Mfrc522::new(spi, OldOutputPin::from(nss)).unwrap();
 //! ```
 
 use core::marker::PhantomData;
 
-use crate::afio;
 use crate::pac::EXTI;
-use crate::rcc::APB2;
-
-/// Slew rates available for Output and relevant AlternateMode Pins
-///
-/// See Table 21 "Output MODE bits" in the reference
-pub enum IOPinSpeed {
-    /// Slew at 10Mhz
-    Mhz10 = 0b01, // (yes, this one is "less" then 2Mhz)
-    /// Slew at 2Mhz
-    Mhz2 = 0b10,
-    /// Slew at 50Mhz
-    Mhz50 = 0b11,
-}
-
-/// Allow setting of the slew rate of an IO pin
-///
-/// Initially all pins are set to the maximum slew rate
-pub trait OutputSpeed<CR> {
-    fn set_speed(&mut self, cr: &mut CR, speed: IOPinSpeed);
-}
 
 /// Extension trait to split a GPIO peripheral in independent pins and registers
 pub trait GpioExt {
-    /// The to split the GPIO into
+    /// The parts to split the GPIO into
     type Parts;
 
     /// Splits the GPIO block into independent pins and registers
-    fn split(self, apb2: &mut APB2) -> Self::Parts;
+    fn split(self) -> Self::Parts;
 }
 
 /// Marker trait for pin mode detection.
@@ -155,10 +127,23 @@ pub enum State {
     Low,
 }
 
-// Using SCREAMING_SNAKE_CASE to be consistent with other HALs
-// see 59b2740 and #125 for motivation
-#[allow(non_camel_case_types)]
+/// GPIO Pin speed selection
+pub enum Speed {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    VeryHigh = 3,
+}
+
+/// Allow setting of the slew rate of an IO pin
+///
+/// Initially all pins are set to the maximum slew rate
+pub trait OutputSpeed {
+    fn set_speed(&mut self, speed: Speed);
+}
+
 #[derive(Debug, PartialEq)]
+#[allow(non_camel_case_types)]
 pub enum Edge {
     RISING,
     FALLING,
@@ -167,12 +152,12 @@ pub enum Edge {
 
 /// External Interrupt Pin
 pub trait ExtiPin {
-    fn make_interrupt_source(&mut self, afio: &mut afio::Parts);
-    fn trigger_on_edge(&mut self, exti: &EXTI, level: Edge);
-    fn enable_interrupt(&mut self, exti: &EXTI);
-    fn disable_interrupt(&mut self, exti: &EXTI);
-    fn clear_interrupt_pending_bit(&mut self);
-    fn check_interrupt(&mut self) -> bool;
+    fn make_interrupt_source(&mut self, exti: &mut EXTI);
+    fn trigger_on_edge(&mut self, exti: &mut EXTI, edge: Edge);
+    fn enable_interrupt(&mut self, exti: &mut EXTI);
+    fn disable_interrupt(&mut self, exti: &mut EXTI);
+    fn clear_interrupt_pending_bit(&mut self, edge: Edge);
+    fn check_interrupt(&mut self, edge: Edge) -> bool;
 }
 
 /// Tracks the current pin state for dynamic pins
@@ -210,8 +195,8 @@ impl Dynamic {
 
 /// NOTE: This trait should ideally be private but must be pub in order to avoid
 /// complaints from the compiler.
-pub trait PinMode<CR> {
-    unsafe fn set_mode(cr: &mut CR) -> Self;
+pub trait PinMode {
+    unsafe fn set_mode() -> Self;
 }
 
 // These impls are needed because a macro can not brace initialise a ty token
@@ -237,20 +222,19 @@ impl Debugger {
 }
 
 macro_rules! gpio {
-    ($GPIOX:ident, $gpiox:ident, $gpioy:ident, $PXx:ident, $extigpionr:expr, [
-        $($PXi:ident: ($pxi:ident, $i:expr, $MODE:ty, $CR:ident, $exticri:ident),)+
+    ($GPIOX:ident, $gpiox:ident, $rcc_bit:expr, $PXx:ident, $extigpionr:expr, [
+        $($PXi:ident: ($pxi:ident, $i:expr, $MODE:ty, $exticri:ident),)+
     ]) => {
         /// GPIO
         pub mod $gpiox {
-            use core::convert::Infallible;
             use core::marker::PhantomData;
+            use core::convert::Infallible;
 
-            use crate::hal::digital::v2::{InputPin, OutputPin, StatefulOutputPin, toggleable};
-            use crate::pac::{$gpioy, $GPIOX};
-            use crate::pac::EXTI;
-            use crate::afio;
+            use embedded_hal::digital::v2::{InputPin, OutputPin, StatefulOutputPin, toggleable};
+            use crate::pac::$GPIOX;
 
-            use crate::rcc::{APB2, Enable, Reset};
+            // use crate::{pac::{RCC, EXTI, SYSCFG}, bb};
+            use crate::pac::{RCC, EXTI};
             use super::{
                 Alternate, Floating, GpioExt, Input,
                 OpenDrain,
@@ -270,15 +254,11 @@ macro_rules! gpio {
                 Dynamic,
                 PinModeError,
                 OutputSpeed,
-                IOPinSpeed,
+                Speed,
             };
 
             /// GPIO parts
             pub struct Parts {
-                /// Opaque CRL register
-                pub crl: CRL,
-                /// Opaque CRH register
-                pub crh: CRH,
                 $(
                     /// Pin
                     pub $pxi: $PXi<$MODE>,
@@ -288,41 +268,17 @@ macro_rules! gpio {
             impl GpioExt for $GPIOX {
                 type Parts = Parts;
 
-                fn split(self, apb: &mut APB2) -> Parts {
-                    $GPIOX::enable(apb);
-                    $GPIOX::reset(apb);
-
+                fn split(self) -> Parts {
+                    unsafe {
+                        // Enable the clock for the peripheral
+                        // NOTE(unsafe) this reference will only be used for atomic writes with no side effects.
+                        (*RCC::ptr()).mc_ahb4ensetr.write(|w| w.bits(1 << $rcc_bit));
+                    }
                     Parts {
-                        crl: CRL { _0: () },
-                        crh: CRH { _0: () },
                         $(
                             $pxi: $PXi { mode: <$MODE>::_new() },
                         )+
                     }
-                }
-            }
-
-            /// Opaque CRL register
-            pub struct CRL {
-                _0: (),
-            }
-
-            impl CRL {
-                // NOTE(allow) we get a warning on GPIOC because it only has 3 high pins
-                #[allow(dead_code)]
-                pub(crate) fn cr(&mut self) -> &$gpioy::CRL {
-                    unsafe { &(*$GPIOX::ptr()).crl }
-                }
-            }
-
-            /// Opaque CRH register
-            pub struct CRH {
-                _0: (),
-            }
-
-            impl CRH {
-                pub(crate) fn cr(&mut self) -> &$gpioy::CRH {
-                    unsafe { &(*$GPIOX::ptr()).crh }
                 }
             }
 
@@ -365,69 +321,106 @@ macro_rules! gpio {
 
             impl<MODE> ExtiPin for Generic<Input<MODE>> {
                 /// Make corresponding EXTI line sensitive to this pin
-                fn make_interrupt_source(&mut self, afio: &mut afio::Parts) {
+                fn make_interrupt_source(&mut self, exti: &mut EXTI) {
                     let offset = 4 * (self.i % 4);
                     match self.i {
                         0..=3 => {
-                            afio.exticr1.exticr1().modify(|r, w| unsafe {
-                                w.bits((r.bits() & !(0xf << offset)) | ($extigpionr << offset))
-                            });
+                            exti.exticr1.modify(|r, w| unsafe {
+                                w.bits((r.bits() & !(0xff << offset)) | ($extigpionr << offset))
+                            })
                         },
                         4..=7 => {
-                            afio.exticr2.exticr2().modify(|r, w| unsafe {
-                                w.bits((r.bits() & !(0xf << offset)) | ($extigpionr << offset))
-                            });
+                            exti.exticr2.modify(|r, w| unsafe {
+                                w.bits((r.bits() & !(0xff << offset)) | ($extigpionr << offset))
+                            })
                         },
                         8..=11 => {
-                            afio.exticr3.exticr3().modify(|r, w| unsafe {
-                                w.bits((r.bits() & !(0xf << offset)) | ($extigpionr << offset))
-                            });
+                            exti.exticr3.modify(|r, w| unsafe {
+                                w.bits((r.bits() & !(0xff << offset)) | ($extigpionr << offset))
+                            })
                         },
                         12..=15 => {
-                            afio.exticr4.exticr4().modify(|r, w| unsafe {
-                                w.bits((r.bits() & !(0xf << offset)) | ($extigpionr << offset))
-                            });
+                            exti.exticr4.modify(|r, w| unsafe {
+                                w.bits((r.bits() & !(0xff << offset)) | ($extigpionr << offset))
+                            })
                         },
                         _ => unreachable!(),
                     }
                 }
 
                 /// Generate interrupt on rising edge, falling edge or both
-                fn trigger_on_edge(&mut self, exti: &EXTI, edge: Edge) {
+                fn trigger_on_edge(&mut self, exti: &mut EXTI, edge: Edge) {
                     match edge {
                         Edge::RISING => {
-                            exti.rtsr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << self.i)) });
-                            exti.ftsr.modify(|r, w| unsafe { w.bits(r.bits() & !(1 << self.i)) });
+                            exti.rtsr1.modify(|r, w| unsafe {
+                                w.bits(r.bits() | (1 << self.i))
+                            });
+                            exti.ftsr1.modify(|r, w| unsafe {
+                                w.bits(r.bits() & !(1 << self.i))
+                            });
                         },
                         Edge::FALLING => {
-                            exti.ftsr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << self.i)) });
-                            exti.rtsr.modify(|r, w| unsafe { w.bits(r.bits() & !(1 << self.i)) });
+                            exti.ftsr1.modify(|r, w| unsafe {
+                                w.bits(r.bits() | (1 << self.i))
+                            });
+                            exti.rtsr1.modify(|r, w| unsafe {
+                                w.bits(r.bits() & !(1 << self.i))
+                            });
                         },
                         Edge::RISING_FALLING => {
-                            exti.rtsr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << self.i)) });
-                            exti.ftsr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << self.i)) });
+                            exti.rtsr1.modify(|r, w| unsafe {
+                                w.bits(r.bits() | (1 << self.i))
+                            });
+                            exti.ftsr1.modify(|r, w| unsafe {
+                                w.bits(r.bits() | (1 << self.i))
+                            });
                         }
                     }
                 }
 
                 /// Enable external interrupts from this pin.
-                fn enable_interrupt(&mut self, exti: &EXTI) {
-                    exti.imr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << self.i)) });
+                fn enable_interrupt(&mut self, exti: &mut EXTI) {
+                    exti.c2imr1.modify(|r, w| unsafe { w.bits(r.bits() | (1 << self.i)) });
                 }
 
                 /// Disable external interrupts from this pin
-                fn disable_interrupt(&mut self, exti: &EXTI) {
-                    exti.imr.modify(|r, w| unsafe { w.bits(r.bits() & !(1 << self.i)) });
+                fn disable_interrupt(&mut self, exti: &mut EXTI) {
+                    exti.c2imr1.modify(|r, w| unsafe { w.bits(r.bits() & !(1 << self.i)) });
                 }
 
                 /// Clear the interrupt pending bit for this pin
-                fn clear_interrupt_pending_bit(&mut self) {
-                    unsafe { (*EXTI::ptr()).pr.write(|w| w.bits(1 << self.i) ) };
+                fn clear_interrupt_pending_bit(&mut self, edge: Edge) {
+                    unsafe {
+                        match edge {
+                            Edge::RISING => {
+                                 ((*EXTI::ptr()).rpr1.write(|w| w.bits(1 << self.i)));
+                            }
+                            Edge::FALLING => {
+                                ((*EXTI::ptr()).fpr1.write(|w| w.bits(1 << self.i)));
+                            }
+                            Edge::RISING_FALLING => {
+                                ((*EXTI::ptr()).rpr1.write(|w| w.bits(1 << self.i)));
+                                ((*EXTI::ptr()).fpr1.write(|w| w.bits(1 << self.i)));
+                            }
+                        }
+                    }
                 }
 
                 /// Reads the interrupt pending bit for this pin
-                fn check_interrupt(&mut self) -> bool {
-                    unsafe { ((*EXTI::ptr()).pr.read().bits() & (1 << self.i)) != 0 }
+                fn check_interrupt(&mut self, edge: Edge) -> bool {
+                    let rising_int = unsafe { (*EXTI::ptr()).rpr1.read().bits() & (1 << self.i) };
+                    let falling_int = unsafe { (*EXTI::ptr()).fpr1.read().bits() & (1 << self.i) };
+                    match edge {
+                        Edge::RISING => {
+                            rising_int != 0
+                        }
+                        Edge::FALLING => {
+                            falling_int != 0
+                        }
+                        Edge::RISING_FALLING => {
+                            rising_int != 0 || falling_int != 0
+                        }
+                    }
                 }
             }
 
@@ -461,7 +454,6 @@ macro_rules! gpio {
 
             impl<MODE> Mode<MODE> for Generic<MODE> {}
 
-
             $(
                 /// Pin
                 pub struct $PXi<MODE> {
@@ -484,23 +476,23 @@ macro_rules! gpio {
                     /// Configures the pin to operate as an alternate function push-pull output
                     /// pin.
                     #[inline]
-                    pub fn into_alternate_push_pull(
-                        self,
-                        cr: &mut $CR,
-                    ) -> $PXi<Alternate<PushPull>> {
-                        const OFFSET: u32 = (4 * $i) % 32;
-                        // Alternate function output push pull
-                        const CNF: u32 = 0b10;
-                        // Output mode, max speed 50 MHz
-                        const MODE: u32 = 0b11;
-                        const BITS: u32 = (CNF << 2) | MODE;
+                    pub fn into_alternate_push_pull(self) -> $PXi<Alternate<PushPull>> {
+                        let offset = 2 * $i;
 
-                        // input mode
-                        cr
-                            .cr()
-                            .modify(|r, w| unsafe {
-                                w.bits((r.bits() & !(0b1111 << OFFSET)) | (BITS << OFFSET))
+                        unsafe {
+                            // Set no pull-up/pull-down
+                            (*$GPIOX::ptr()).pupdr.modify(|r, w| {
+                                w.bits((r.bits() & !(0b11 << offset)) | (0b00 << offset))
                             });
+                            // Set push-pull
+                            (*$GPIOX::ptr()).otyper.modify(|r, w| {
+                                w.bits(r.bits() & !(0b1 << $i))
+                            });
+                            // Set alternate function mode
+                            (*$GPIOX::ptr()).moder.modify(|r, w| {
+                                w.bits((r.bits() & !(0b11 << offset)) | (0b10 << offset))
+                            })
+                        };
 
                         $PXi { mode: Alternate::_new() }
                     }
@@ -508,68 +500,56 @@ macro_rules! gpio {
                     /// Configures the pin to operate as an alternate function open-drain output
                     /// pin.
                     #[inline]
-                    pub fn into_alternate_open_drain(
-                        self,
-                        cr: &mut $CR,
-                    ) -> $PXi<Alternate<OpenDrain>> {
-                        const OFFSET: u32 = (4 * $i) % 32;
-                        // Alternate function output open drain
-                        const CNF: u32 = 0b11;
-                        // Output mode, max speed 50 MHz
-                        const MODE: u32 = 0b11;
-                        const BITS: u32 = (CNF << 2) | MODE;
+                    pub fn into_alternate_open_drain(self) -> $PXi<Alternate<OpenDrain>> {
+                        let offset = 2 * $i;
 
-                        // input mode
-                        cr
-                            .cr()
-                            .modify(|r, w| unsafe {
-                                w.bits((r.bits() & !(0b1111 << OFFSET)) | (BITS << OFFSET))
+                        unsafe {
+                            // Set no pull-up/pull-down
+                            (*$GPIOX::ptr()).pupdr.modify(|r, w| {
+                                w.bits((r.bits() & !(0b11 << offset)) | (0b00 << offset))
                             });
+                            // Set open-drain
+                            (*$GPIOX::ptr()).otyper.modify(|r, w| {
+                                w.bits(r.bits() | (0b1 << $i))
+                            });
+                            // Set alternate function mode
+                            (*$GPIOX::ptr()).moder.modify(|r, w| {
+                                w.bits((r.bits() & !(0b11 << offset)) | (0b10 << offset))
+                            })
+                        };
 
                         $PXi { mode: Alternate::_new() }
                     }
 
                     /// Configures the pin to operate as a floating input pin
                     #[inline]
-                    pub fn into_floating_input(
-                        self,
-                        cr: &mut $CR,
-                    ) -> $PXi<Input<Floating>> {
+                    pub fn into_floating_input(self) -> $PXi<Input<Floating>> {
                         unsafe {
-                            $PXi::<Input<Floating>>::set_mode(cr)
+                            $PXi::<Input<Floating>>::set_mode()
                         }
                     }
 
                     /// Configures the pin to operate as a pulled down input pin
                     #[inline]
-                    pub fn into_pull_down_input(
-                        self,
-                        cr: &mut $CR,
-                    ) -> $PXi<Input<PullDown>> {
+                    pub fn into_pull_down_input(self) -> $PXi<Input<PullDown>> {
                         unsafe {
-                            $PXi::<Input<PullDown>>::set_mode(cr)
+                            $PXi::<Input<PullDown>>::set_mode()
                         }
                     }
 
                     /// Configures the pin to operate as a pulled up input pin
                     #[inline]
-                    pub fn into_pull_up_input(
-                        self,
-                        cr: &mut $CR,
-                    ) -> $PXi<Input<PullUp>> {
+                    pub fn into_pull_up_input(self) -> $PXi<Input<PullUp>> {
                         unsafe {
-                            $PXi::<Input<PullUp>>::set_mode(cr)
+                            $PXi::<Input<PullUp>>::set_mode()
                         }
                     }
 
                     /// Configures the pin to operate as an open-drain output pin.
                     /// Initial state will be low.
                     #[inline]
-                    pub fn into_open_drain_output(
-                        self,
-                        cr: &mut $CR,
-                    ) -> $PXi<Output<OpenDrain>> {
-                        self.into_open_drain_output_with_state(cr, State::Low)
+                    pub fn into_open_drain_output(self) -> $PXi<Output<OpenDrain>> {
+                        self.into_open_drain_output_with_state(State::Low)
                     }
 
                     /// Configures the pin to operate as an open-drain output pin.
@@ -577,22 +557,18 @@ macro_rules! gpio {
                     #[inline]
                     pub fn into_open_drain_output_with_state(
                         mut self,
-                        cr: &mut $CR,
                         initial_state: State,
                     ) -> $PXi<Output<OpenDrain>> {
                         self.set_state(initial_state);
                         unsafe {
-                            $PXi::<Output<OpenDrain>>::set_mode(cr)
+                            $PXi::<Output<OpenDrain>>::set_mode()
                         }
                     }
                     /// Configures the pin to operate as an push-pull output pin.
                     /// Initial state will be low.
                     #[inline]
-                    pub fn into_push_pull_output(
-                        self,
-                        cr: &mut $CR,
-                    ) -> $PXi<Output<PushPull>> {
-                        self.into_push_pull_output_with_state(cr, State::Low)
+                    pub fn into_push_pull_output(self) -> $PXi<Output<PushPull>> {
+                        self.into_push_pull_output_with_state(State::Low)
                     }
 
                     /// Configures the pin to operate as an push-pull output pin.
@@ -600,20 +576,19 @@ macro_rules! gpio {
                     #[inline]
                     pub fn into_push_pull_output_with_state(
                         mut self,
-                        cr: &mut $CR,
                         initial_state: State,
                     ) -> $PXi<Output<PushPull>> {
                         self.set_state(initial_state);
                         unsafe {
-                            $PXi::<Output<PushPull>>::set_mode(cr)
+                            $PXi::<Output<PushPull>>::set_mode()
                         }
                     }
 
                     /// Configures the pin to operate as an analog input pin
                     #[inline]
-                    pub fn into_analog(self, cr: &mut $CR) -> $PXi<Analog> {
+                    pub fn into_analog(self) -> $PXi<Analog> {
                         unsafe {
-                            $PXi::<Analog>::set_mode(cr)
+                            $PXi::<Analog>::set_mode()
                         }
                     }
 
@@ -621,8 +596,8 @@ macro_rules! gpio {
                     /// and output without changing the type. It starts out
                     /// as a floating input
                     #[inline]
-                    pub fn into_dynamic(self, cr: &mut $CR) -> $PXi<Dynamic> {
-                        self.into_floating_input(cr);
+                    pub fn into_dynamic(self) -> $PXi<Dynamic> {
+                        self.into_floating_input();
                         $PXi::<Dynamic>{mode: Dynamic::InputFloating}
                     }
                 }
@@ -644,13 +619,12 @@ macro_rules! gpio {
                         #[inline]
                         pub fn $fn_name(
                             &mut self,
-                            cr: &mut $CR,
                             mut f: impl FnMut(&mut $PXi<$mode>)
                         ) {
-                            let mut temp = unsafe { $PXi::<$mode>::set_mode(cr) };
+                            let mut temp = unsafe { $PXi::<$mode>::set_mode() };
                             f(&mut temp);
                             unsafe {
-                                Self::set_mode(cr);
+                                Self::set_mode();
                             }
                         }
 
@@ -664,15 +638,14 @@ macro_rules! gpio {
                         #[inline]
                         pub fn $stateful_fn_name(
                             &mut self,
-                            cr: &mut $CR,
                             state: State,
                             mut f: impl FnMut(&mut $PXi<$mode>)
                         ) {
                             self.set_state(state);
-                            let mut temp = unsafe { $PXi::<$mode>::set_mode(cr) };
+                            let mut temp = unsafe { $PXi::<$mode>::set_mode() };
                             f(&mut temp);
                             unsafe {
-                                Self::set_mode(cr);
+                                Self::set_mode();
                             }
                         }
                     }
@@ -688,19 +661,18 @@ macro_rules! gpio {
                         #[inline]
                         pub fn $fn_name(
                             &mut self,
-                            cr: &mut $CR,
                             mut f: impl FnMut(&mut $PXi<$mode>)
                         ) {
-                            let mut temp = unsafe { $PXi::<$mode>::set_mode(cr) };
+                            let mut temp = unsafe { $PXi::<$mode>::set_mode() };
                             f(&mut temp);
                             unsafe {
-                                Self::set_mode(cr);
+                                Self::set_mode();
                             }
                         }
                     }
                 }
 
-                impl<MODE> $PXi<MODE> where MODE: Active, $PXi<MODE>: PinMode<$CR> {
+                impl<MODE> $PXi<MODE> where MODE: Active, $PXi<MODE>: PinMode {
                     impl_temp_output!(
                         as_push_pull_output,
                         as_push_pull_output_with_state,
@@ -773,23 +745,27 @@ macro_rules! gpio {
                     }
                 }
 
-                impl<MODE> OutputSpeed<$CR> for $PXi<Output<MODE>> {
-                    fn set_speed(&mut self, cr: &mut $CR, speed: IOPinSpeed){
-                        const OFFSET: u32 = (4 * $i) % 32;
+                impl<MODE> OutputSpeed for $PXi<Output<MODE>> {
+                    fn set_speed(&mut self, speed: Speed) {
+                        let offset = $i * 2;
 
-                        cr.cr().modify(|r, w| unsafe {
-                            w.bits((r.bits() & !(0b11 << OFFSET)) | ((speed as u32) << OFFSET))
-                        });
+                        unsafe {
+                            (*$GPIOX::ptr()).ospeedr.modify(|r, w| {
+                                w.bits((r.bits() & !(0b11 << offset)) | ((speed as u32) << offset))
+                            });
+                        }
                     }
                 }
 
-                impl OutputSpeed<$CR> for $PXi<Alternate<PushPull>> {
-                    fn set_speed(&mut self, cr: &mut $CR, speed: IOPinSpeed){
-                        const OFFSET: u32 = (4 * $i) % 32;
+                impl OutputSpeed for $PXi<Alternate<PushPull>> {
+                    fn set_speed(&mut self, speed: Speed){
+                        let offset = $i * 2;
 
-                        cr.cr().modify(|r, w| unsafe {
-                            w.bits((r.bits() & !(0b11 << OFFSET)) | ((speed as u32) << OFFSET))
-                        });
+                        unsafe {
+                            (*$GPIOX::ptr()).ospeedr.modify(|r, w| {
+                                w.bits((r.bits() & !(0b11 << offset)) | ((speed as u32) << offset))
+                            });
+                        }
                     }
                 }
 
@@ -827,33 +803,33 @@ macro_rules! gpio {
 
                 impl $PXi<Dynamic> {
                     #[inline]
-                    pub fn make_pull_up_input(&mut self, cr: &mut $CR) {
+                    pub fn make_pull_up_input(&mut self) {
                         // NOTE(unsafe), we have a mutable reference to the current pin
-                        unsafe { $PXi::<Input<PullUp>>::set_mode(cr) };
+                        unsafe { $PXi::<Input<PullUp>>::set_mode() };
                         self.mode = Dynamic::InputPullUp;
                     }
                     #[inline]
-                    pub fn make_pull_down_input(&mut self, cr: &mut $CR) {
+                    pub fn make_pull_down_input(&mut self) {
                         // NOTE(unsafe), we have a mutable reference to the current pin
-                        unsafe { $PXi::<Input<PullDown>>::set_mode(cr) };
+                        unsafe { $PXi::<Input<PullDown>>::set_mode() };
                         self.mode = Dynamic::InputPullDown;
                     }
                     #[inline]
-                    pub fn make_floating_input(&mut self, cr: &mut $CR) {
+                    pub fn make_floating_input(&mut self) {
                         // NOTE(unsafe), we have a mutable reference to the current pin
-                        unsafe { $PXi::<Input<Floating>>::set_mode(cr) };
+                        unsafe { $PXi::<Input<Floating>>::set_mode() };
                         self.mode = Dynamic::InputFloating;
                     }
                     #[inline]
-                    pub fn make_push_pull_output(&mut self, cr: &mut $CR) {
+                    pub fn make_push_pull_output(&mut self) {
                         // NOTE(unsafe), we have a mutable reference to the current pin
-                        unsafe { $PXi::<Output<PushPull>>::set_mode(cr) };
+                        unsafe { $PXi::<Output<PushPull>>::set_mode() };
                         self.mode = Dynamic::OutputPushPull;
                     }
                     #[inline]
-                    pub fn make_open_drain_output(&mut self, cr: &mut $CR) {
+                    pub fn make_open_drain_output(&mut self) {
                         // NOTE(unsafe), we have a mutable reference to the current pin
-                        unsafe { $PXi::<Output<OpenDrain>>::set_mode(cr) };
+                        unsafe { $PXi::<Output<OpenDrain>>::set_mode() };
                         self.mode = Dynamic::OutputOpenDrain;
                     }
                 }
@@ -900,55 +876,120 @@ macro_rules! gpio {
 
                 impl<MODE> ExtiPin for $PXi<Input<MODE>> {
                     /// Configure EXTI Line $i to trigger from this pin.
-                    fn make_interrupt_source(&mut self, afio: &mut afio::Parts) {
+                    fn make_interrupt_source(&mut self, exti: &mut EXTI) {
                         let offset = 4 * ($i % 4);
-                        afio.$exticri.$exticri().modify(|r, w| unsafe {
-                            let mut exticr = r.bits();
-                            exticr = (exticr & !(0xf << offset)) | ($extigpionr << offset);
-                            w.bits(exticr)
-                        });
+                        match $i {
+                            0..=3 => {
+                                exti.exticr1.modify(|r, w| unsafe {
+                                    w.bits((r.bits() & !(0xff << offset)) | ($extigpionr << offset))
+                                })
+                            },
+                            4..=7 => {
+                                exti.exticr2.modify(|r, w| unsafe {
+                                    w.bits((r.bits() & !(0xff << offset)) | ($extigpionr << offset))
+                                })
+                            },
+                            8..=11 => {
+                                exti.exticr3.modify(|r, w| unsafe {
+                                    w.bits((r.bits() & !(0xff << offset)) | ($extigpionr << offset))
+                                })
+                            },
+                            12..=15 => {
+                                exti.exticr4.modify(|r, w| unsafe {
+                                    w.bits((r.bits() & !(0xff << offset)) | ($extigpionr << offset))
+                                })
+                            },
+                            _ => unreachable!(),
+                        }
                     }
 
                     /// Generate interrupt on rising edge, falling edge or both
-                    fn trigger_on_edge(&mut self, exti: &EXTI, edge: Edge) {
+                    fn trigger_on_edge(&mut self, exti: &mut EXTI, edge: Edge) {
                         match edge {
                             Edge::RISING => {
-                                exti.rtsr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << $i)) });
-                                exti.ftsr.modify(|r, w| unsafe { w.bits(r.bits() & !(1 << $i)) });
+                                exti.rtsr1.modify(|r, w| unsafe {
+                                    w.bits(r.bits() | (1 << $i))
+                                });
+                                exti.ftsr1.modify(|r, w| unsafe {
+                                    w.bits(r.bits() & !(1 << $i))
+                                });
                             },
                             Edge::FALLING => {
-                                exti.ftsr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << $i)) });
-                                exti.rtsr.modify(|r, w| unsafe { w.bits(r.bits() & !(1 << $i)) });
+                                exti.ftsr1.modify(|r, w| unsafe {
+                                    w.bits(r.bits() | (1 << $i))
+                                });
+                                exti.rtsr1.modify(|r, w| unsafe {
+                                    w.bits(r.bits() & !(1 << $i))
+                                });
                             },
                             Edge::RISING_FALLING => {
-                                exti.rtsr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << $i)) });
-                                exti.ftsr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << $i)) });
+                                exti.rtsr1.modify(|r, w| unsafe {
+                                    w.bits(r.bits() | (1 << $i))
+                                });
+                                exti.ftsr1.modify(|r, w| unsafe {
+                                    w.bits(r.bits() | (1 << $i))
+                                });
                             }
                         }
                     }
 
                     /// Enable external interrupts from this pin.
                     #[inline]
-                    fn enable_interrupt(&mut self, exti: &EXTI) {
-                        exti.imr.modify(|r, w| unsafe { w.bits(r.bits() | (1 << $i)) });
+                    fn enable_interrupt(&mut self, exti: &mut EXTI) {
+                        exti.c2imr1.modify(|r, w| unsafe { w.bits(r.bits() | (1 << $i)) });
                     }
 
                     /// Disable external interrupts from this pin
                     #[inline]
-                    fn disable_interrupt(&mut self, exti: &EXTI) {
-                        exti.imr.modify(|r, w| unsafe { w.bits(r.bits() & !(1 << $i)) });
+                    fn disable_interrupt(&mut self, exti: &mut EXTI) {
+                        exti.c2imr1.modify(|r, w| unsafe { w.bits(r.bits() & !(1 << $i)) });
                     }
 
                     /// Clear the interrupt pending bit for this pin
                     #[inline]
-                    fn clear_interrupt_pending_bit(&mut self) {
-                        unsafe { (*EXTI::ptr()).pr.write(|w| w.bits(1 << $i) ) };
+                    fn clear_interrupt_pending_bit(&mut self, edge: Edge) {
+                        unsafe {
+                            match edge {
+                                Edge::RISING => {
+                                     ((*EXTI::ptr()).rpr1.write(|w| w.bits(1 << $i)));
+                                }
+                                Edge::FALLING => {
+                                    ((*EXTI::ptr()).fpr1.write(|w| w.bits(1 << $i)));
+                                }
+                                Edge::RISING_FALLING => {
+                                    ((*EXTI::ptr()).rpr1.write(|w| w.bits(1 << $i)));
+                                    ((*EXTI::ptr()).fpr1.write(|w| w.bits(1 << $i)));
+                                }
+                            }
+                        }
                     }
 
                     /// Reads the interrupt pending bit for this pin
                     #[inline]
-                    fn check_interrupt(&mut self) -> bool {
-                        unsafe { ((*EXTI::ptr()).pr.read().bits() & (1 << $i)) != 0 }
+                    fn check_interrupt(&mut self, edge: Edge) -> bool {
+                        match edge {
+                            Edge::RISING => {
+                                let rising_int = unsafe {
+                                    (*EXTI::ptr()).rpr1.read().bits() & (1 << $i)
+                                };
+                                rising_int != 0
+                            }
+                            Edge::FALLING => {
+                                let falling_int = unsafe {
+                                    (*EXTI::ptr()).fpr1.read().bits() & (1 << $i)
+                                };
+                                falling_int != 0
+                            }
+                            Edge::RISING_FALLING => {
+                                let rising_int = unsafe {
+                                    (*EXTI::ptr()).rpr1.read().bits() & (1 << $i)
+                                };
+                                let falling_int = unsafe {
+                                    (*EXTI::ptr()).fpr1.read().bits() & (1 << $i)
+                                };
+                                rising_int != 0 || falling_int != 0
+                            }
+                        }
                     }
                 }
 
@@ -986,129 +1027,111 @@ macro_rules! gpio {
                     }
                 }
 
-                impl PinMode<$CR> for $PXi<Input<Floating>> {
-                    unsafe fn set_mode(cr: &mut $CR) -> Self {
-                        const OFFSET: u32 = (4 * $i) % 32;
-                        // Floating input
-                        const CNF: u32 = 0b01;
-                        // Input mode
-                        const MODE: u32 = 0b00;
-                        const BITS: u32 = (CNF << 2) | MODE;
+                impl PinMode for $PXi<Input<Floating>> {
+                    unsafe fn set_mode() -> Self {
+                        let offset = 2 * $i;
 
-                        // input mode
-                        cr
-                            .cr()
-                            .modify(|r, w| {
-                                w.bits((r.bits() & !(0b1111 << OFFSET)) | (BITS << OFFSET))
-                            });
+                        // Set to floating
+                        (*$GPIOX::ptr()).pupdr.modify(|r, w| {
+                            w.bits((r.bits() & !(0b11 << offset)))
+                        });
+                        // Set to input
+                        (*$GPIOX::ptr()).moder.modify(|r, w| {
+                            w.bits((r.bits() & !(0b11 << offset)))
+                        });
 
                         $PXi { mode: Input::_new() }
                     }
                 }
 
-                impl PinMode<$CR> for $PXi<Input<PullDown>> {
-                    unsafe fn set_mode(cr: &mut $CR) -> Self {
-                        const OFFSET: u32 = (4 * $i) % 32;
-                        // Pull up/down input
-                        const CNF: u32 = 0b10;
-                        // Input mode
-                        const MODE: u32 = 0b00;
-                        const BITS: u32 = (CNF << 2) | MODE;
+                impl PinMode for $PXi<Input<PullDown>> {
+                    unsafe fn set_mode() -> Self {
+                        let offset = $i * 2;
 
-                        //pull down:
-                        // NOTE(unsafe) atomic write to a stateless register
-                        (*$GPIOX::ptr()).bsrr.write(|w| w.bits(1 << (16 + $i)));
-
-                        // input mode
-                        cr
-                            .cr()
-                            .modify(|r, w| {
-                                w.bits((r.bits() & !(0b1111 << OFFSET)) | (BITS << OFFSET))
-                            });
+                        // Set to input
+                        (*$GPIOX::ptr()).moder.modify(|r, w|
+                            w.bits(r.bits() & !(0b11 << offset))
+                        );
+                        // Set to pull-down
+                        (*$GPIOX::ptr()).pupdr.modify(|r, w|
+                            w.bits(r.bits() & !(0b11 << offset) | (0b10 << offset))
+                        );
 
                         $PXi { mode: Input::_new() }
                     }
                 }
 
+                impl PinMode for $PXi<Input<PullUp>> {
+                    unsafe fn set_mode() -> Self {
+                        let offset = $i * 2;
 
-                impl PinMode<$CR> for $PXi<Input<PullUp>> {
-                    unsafe fn set_mode(cr: &mut $CR) -> Self {
-                        const OFFSET: u32 = (4 * $i) % 32;
-                        // Pull up/down input
-                        const CNF: u32 = 0b10;
-                        // Input mode
-                        const MODE: u32 = 0b00;
-                        const BITS: u32 = (CNF << 2) | MODE;
-
-                        //pull up:
-                        // NOTE(unsafe) atomic write to a stateless register
-                        (*$GPIOX::ptr()).bsrr.write(|w| w.bits(1 << $i));
-
-                        // input mode
-                        cr
-                            .cr()
-                            .modify(|r, w| {
-                                w.bits((r.bits() & !(0b1111 << OFFSET)) | (BITS << OFFSET))
-                            });
+                        // Set to input
+                        (*$GPIOX::ptr()).moder.modify(|r, w|
+                            w.bits(r.bits() & !(0b11 << offset))
+                        );
+                        // Set to pull-up
+                        (*$GPIOX::ptr()).pupdr.modify(|r, w|
+                            w.bits(r.bits() & !(0b11 << offset) | (0b01 << offset))
+                        );
 
                         $PXi { mode: Input::_new() }
                     }
                 }
 
-                impl PinMode<$CR> for $PXi<Output<OpenDrain>> {
-                    unsafe fn set_mode(cr: &mut $CR) -> Self {
-                        const OFFSET: u32 = (4 * $i) % 32;
-                        // General purpose output open-drain
-                        const CNF: u32 = 0b01;
-                        // Open-Drain Output mode, max speed 50 MHz
-                        const MODE: u32 = 0b11;
-                        const BITS: u32 = (CNF << 2) | MODE;
+                impl PinMode for $PXi<Output<OpenDrain>> {
+                    unsafe fn set_mode() -> Self {
+                        let offset = $i * 2;
 
-                        cr
-                            .cr()
-                            .modify(|r, w| {
-                                w.bits((r.bits() & !(0b1111 << OFFSET)) | (BITS << OFFSET))
-                            });
+                        // Set no pull-up/pull-down
+                        (*$GPIOX::ptr()).pupdr.modify(|r, w| {
+                            w.bits((r.bits() & !(0b11 << offset)) | (0b00 << offset))
+                        });
+                        // Set open-drain
+                        (*$GPIOX::ptr()).otyper.modify(|r, w| {
+                            w.bits(r.bits() | (0b1 << $i))
+                        });
+                        // Set output mode
+                        (*$GPIOX::ptr()).moder.modify(|r, w| {
+                            w.bits((r.bits() & !(0b11 << offset)) | (0b01 << offset))
+                        });
 
                         $PXi { mode: Output::_new() }
                     }
                 }
 
-                impl PinMode<$CR> for $PXi<Output<PushPull>> {
-                    unsafe fn set_mode(cr: &mut $CR) -> Self {
-                        const OFFSET: u32 = (4 * $i) % 32;
-                        // General purpose output push-pull
-                        const CNF: u32 = 0b00;
-                        // Output mode, max speed 50 MHz
-                        const MODE: u32 = 0b11;
-                        const BITS: u32 = (CNF << 2) | MODE;
+                impl PinMode for $PXi<Output<PushPull>> {
+                    unsafe fn set_mode() -> Self {
+                        let offset = $i * 2;
 
-
-                        cr
-                            .cr()
-                            .modify(|r, w| {
-                                w.bits((r.bits() & !(0b1111 << OFFSET)) | (BITS << OFFSET))
-                            });
+                        // Set no pull-up/pull-down
+                        (*$GPIOX::ptr()).pupdr.modify(|r, w| {
+                            w.bits((r.bits() & !(0b11 << offset)) | (0b00 << offset))
+                        });
+                        // Set push-pull
+                        (*$GPIOX::ptr()).otyper.modify(|r, w| {
+                            w.bits(r.bits() & !(0b1 << $i))
+                        });
+                        // Set output mode
+                        (*$GPIOX::ptr()).moder.modify(|r, w| {
+                            w.bits((r.bits() & !(0b11 << offset)) | (0b01 << offset))
+                        });
 
                         $PXi { mode: Output::_new() }
                     }
                 }
 
-                impl PinMode<$CR> for $PXi<Analog> {
-                    unsafe fn set_mode(cr: &mut $CR) -> Self {
-                        const OFFSET: u32 = (4 * $i) % 32;
-                        // Analog input
-                        const CNF: u32 = 0b00;
-                        // Input mode
-                        const MODE: u32 = 0b00;
-                        const BITS: u32 = (CNF << 2) | MODE;
+                impl PinMode for $PXi<Analog> {
+                    unsafe fn set_mode() -> Self {
+                        let offset = $i * 2;
 
-                        // analog mode
-                        cr
-                            .cr()
-                            .modify(|r, w| {
-                                w.bits((r.bits() & !(0b1111 << OFFSET)) | (BITS << OFFSET))
-                            });
+                        // Set no pull-up/pull-down
+                        (*$GPIOX::ptr()).pupdr.modify(|r, w| {
+                            w.bits((r.bits() & !(0b11 << offset)) | (0b00 << offset))
+                        });
+                        // Set output mode
+                        (*$GPIOX::ptr()).moder.modify(|r, w| {
+                            w.bits((r.bits() & !(0b11 << offset)) | (0b11 << offset))
+                        });
 
                         $PXi { mode: Analog{} }
                     }
@@ -1189,39 +1212,39 @@ macro_rules! impl_pxx {
         }
 
         impl<MODE> ExtiPin for Pxx<Input<MODE>> {
-            fn make_interrupt_source(&mut self, afio: &mut afio::Parts) {
+            fn make_interrupt_source(&mut self, exti: &mut EXTI) {
                 match self {
-                    $(Pxx::$pin(pin) => pin.make_interrupt_source(afio)),*
+                    $(Pxx::$pin(pin) => pin.make_interrupt_source(exti)),*
                 }
             }
 
-            fn trigger_on_edge(&mut self, exti: &EXTI, level: Edge) {
+            fn trigger_on_edge(&mut self, exti: &mut EXTI, level: Edge) {
                 match self {
                     $(Pxx::$pin(pin) => pin.trigger_on_edge(exti, level)),*
                 }
             }
 
-            fn enable_interrupt(&mut self, exti: &EXTI) {
+            fn enable_interrupt(&mut self, exti: &mut EXTI) {
                 match self {
                     $(Pxx::$pin(pin) => pin.enable_interrupt(exti)),*
                 }
             }
 
-            fn disable_interrupt(&mut self, exti: &EXTI) {
+            fn disable_interrupt(&mut self, exti: &mut EXTI) {
                 match self {
                     $(Pxx::$pin(pin) => pin.disable_interrupt(exti)),*
                 }
             }
 
-            fn clear_interrupt_pending_bit(&mut self) {
+            fn clear_interrupt_pending_bit(&mut self, edge: Edge) {
                 match self {
-                    $(Pxx::$pin(pin) => pin.clear_interrupt_pending_bit()),*
+                    $(Pxx::$pin(pin) => pin.clear_interrupt_pending_bit(edge)),*
                 }
             }
 
-            fn check_interrupt(&mut self) -> bool {
+            fn check_interrupt(&mut self, edge: Edge) -> bool {
                 match self {
-                    $(Pxx::$pin(pin) => pin.check_interrupt()),*
+                    $(Pxx::$pin(pin) => pin.check_interrupt(edge)),*
                 }
             }
         }
@@ -1233,100 +1256,212 @@ impl_pxx! {
     (gpiob::PBx),
     (gpioc::PCx),
     (gpiod::PDx),
-    (gpioe::PEx)
+    (gpioe::PEx),
+    (gpiof::PFx),
+    (gpiog::PGx),
+    (gpioh::PHx),
+    (gpioi::PIx),
+    (gpioj::PJx),
+    (gpiok::PKx)
 }
 
-gpio!(GPIOA, gpioa, gpioa, PAx, 0, [
-    PA0: (pa0, 0, Input<Floating>, CRL, exticr1),
-    PA1: (pa1, 1, Input<Floating>, CRL, exticr1),
-    PA2: (pa2, 2, Input<Floating>, CRL, exticr1),
-    PA3: (pa3, 3, Input<Floating>, CRL, exticr1),
-    PA4: (pa4, 4, Input<Floating>, CRL, exticr2),
-    PA5: (pa5, 5, Input<Floating>, CRL, exticr2),
-    PA6: (pa6, 6, Input<Floating>, CRL, exticr2),
-    PA7: (pa7, 7, Input<Floating>, CRL, exticr2),
-    PA8: (pa8, 8, Input<Floating>, CRH, exticr3),
-    PA9: (pa9, 9, Input<Floating>, CRH, exticr3),
-    PA10: (pa10, 10, Input<Floating>, CRH, exticr3),
-    PA11: (pa11, 11, Input<Floating>, CRH, exticr3),
-    PA12: (pa12, 12, Input<Floating>, CRH, exticr4),
-    PA13: (pa13, 13, Debugger, CRH, exticr4),
-    PA14: (pa14, 14, Debugger, CRH, exticr4),
-    PA15: (pa15, 15, Debugger, CRH, exticr4),
+gpio!(GPIOA, gpioa, 0, PAx, 0, [
+    PA0: (pa0, 0, Input<Floating>, exticr1),
+    PA1: (pa1, 1, Input<Floating>, exticr1),
+    PA2: (pa2, 2, Input<Floating>, exticr1),
+    PA3: (pa3, 3, Input<Floating>, exticr1),
+    PA4: (pa4, 4, Input<Floating>, exticr2),
+    PA5: (pa5, 5, Input<Floating>, exticr2),
+    PA6: (pa6, 6, Input<Floating>, exticr2),
+    PA7: (pa7, 7, Input<Floating>, exticr2),
+    PA8: (pa8, 8, Input<Floating>, exticr3),
+    PA9: (pa9, 9, Input<Floating>, exticr3),
+    PA10: (pa10, 10, Input<Floating>, exticr3),
+    PA11: (pa11, 11, Input<Floating>, exticr3),
+    PA12: (pa12, 12, Input<Floating>, exticr4),
+    PA13: (pa13, 13, Input<Floating>, exticr4),
+    PA14: (pa14, 14, Input<Floating>, exticr4),
+    PA15: (pa15, 15, Input<Floating>, exticr4),
 ]);
 
-gpio!(GPIOB, gpiob, gpioa, PBx, 1, [
-    PB0: (pb0, 0, Input<Floating>, CRL, exticr1),
-    PB1: (pb1, 1, Input<Floating>, CRL, exticr1),
-    PB2: (pb2, 2, Input<Floating>, CRL, exticr1),
-    PB3: (pb3, 3, Debugger, CRL, exticr1),
-    PB4: (pb4, 4, Debugger, CRL, exticr2),
-    PB5: (pb5, 5, Input<Floating>, CRL, exticr2),
-    PB6: (pb6, 6, Input<Floating>, CRL, exticr2),
-    PB7: (pb7, 7, Input<Floating>, CRL, exticr2),
-    PB8: (pb8, 8, Input<Floating>, CRH, exticr3),
-    PB9: (pb9, 9, Input<Floating>, CRH, exticr3),
-    PB10: (pb10, 10, Input<Floating>, CRH, exticr3),
-    PB11: (pb11, 11, Input<Floating>, CRH, exticr3),
-    PB12: (pb12, 12, Input<Floating>, CRH, exticr4),
-    PB13: (pb13, 13, Input<Floating>, CRH, exticr4),
-    PB14: (pb14, 14, Input<Floating>, CRH, exticr4),
-    PB15: (pb15, 15, Input<Floating>, CRH, exticr4),
+gpio!(GPIOB, gpiob, 1, PBx, 1, [
+    PB0: (pb0, 0, Input<Floating>, exticr1),
+    PB1: (pb1, 1, Input<Floating>, exticr1),
+    PB2: (pb2, 2, Input<Floating>, exticr1),
+    PB3: (pb3, 3, Input<Floating>, exticr1),
+    PB4: (pb4, 4, Input<Floating>, exticr2),
+    PB5: (pb5, 5, Input<Floating>, exticr2),
+    PB6: (pb6, 6, Input<Floating>, exticr2),
+    PB7: (pb7, 7, Input<Floating>, exticr2),
+    PB8: (pb8, 8, Input<Floating>, exticr3),
+    PB9: (pb9, 9, Input<Floating>, exticr3),
+    PB10: (pb10, 10, Input<Floating>, exticr3),
+    PB11: (pb11, 11, Input<Floating>, exticr3),
+    PB12: (pb12, 12, Input<Floating>, exticr4),
+    PB13: (pb13, 13, Input<Floating>, exticr4),
+    PB14: (pb14, 14, Input<Floating>, exticr4),
+    PB15: (pb15, 15, Input<Floating>, exticr4),
 ]);
 
-gpio!(GPIOC, gpioc, gpioa, PCx, 2, [
-    PC0: (pc0, 0, Input<Floating>, CRL, exticr1),
-    PC1: (pc1, 1, Input<Floating>, CRL, exticr1),
-    PC2: (pc2, 2, Input<Floating>, CRL, exticr1),
-    PC3: (pc3, 3, Input<Floating>, CRL, exticr1),
-    PC4: (pc4, 4, Input<Floating>, CRL, exticr2),
-    PC5: (pc5, 5, Input<Floating>, CRL, exticr2),
-    PC6: (pc6, 6, Input<Floating>, CRL, exticr2),
-    PC7: (pc7, 7, Input<Floating>, CRL, exticr2),
-    PC8: (pc8, 8, Input<Floating>, CRH, exticr3),
-    PC9: (pc9, 9, Input<Floating>, CRH, exticr3),
-    PC10: (pc10, 10, Input<Floating>, CRH, exticr3),
-    PC11: (pc11, 11, Input<Floating>, CRH, exticr3),
-    PC12: (pc12, 12, Input<Floating>, CRH, exticr4),
-    PC13: (pc13, 13, Input<Floating>, CRH, exticr4),
-    PC14: (pc14, 14, Input<Floating>, CRH, exticr4),
-    PC15: (pc15, 15, Input<Floating>, CRH, exticr4),
+gpio!(GPIOC, gpioc, 2, PCx, 2, [
+    PC0: (pc0, 0, Input<Floating>, exticr1),
+    PC1: (pc1, 1, Input<Floating>, exticr1),
+    PC2: (pc2, 2, Input<Floating>, exticr1),
+    PC3: (pc3, 3, Input<Floating>, exticr1),
+    PC4: (pc4, 4, Input<Floating>, exticr2),
+    PC5: (pc5, 5, Input<Floating>, exticr2),
+    PC6: (pc6, 6, Input<Floating>, exticr2),
+    PC7: (pc7, 7, Input<Floating>, exticr2),
+    PC8: (pc8, 8, Input<Floating>, exticr3),
+    PC9: (pc9, 9, Input<Floating>, exticr3),
+    PC10: (pc10, 10, Input<Floating>, exticr3),
+    PC11: (pc11, 11, Input<Floating>, exticr3),
+    PC12: (pc12, 12, Input<Floating>, exticr4),
+    PC13: (pc13, 13, Input<Floating>, exticr4),
+    PC14: (pc14, 14, Input<Floating>, exticr4),
+    PC15: (pc15, 15, Input<Floating>, exticr4),
 ]);
 
-gpio!(GPIOD, gpiod, gpioa, PDx, 3, [
-    PD0: (pd0, 0, Input<Floating>, CRL, exticr1),
-    PD1: (pd1, 1, Input<Floating>, CRL, exticr1),
-    PD2: (pd2, 2, Input<Floating>, CRL, exticr1),
-    PD3: (pd3, 3, Input<Floating>, CRL, exticr1),
-    PD4: (pd4, 4, Input<Floating>, CRL, exticr2),
-    PD5: (pd5, 5, Input<Floating>, CRL, exticr2),
-    PD6: (pd6, 6, Input<Floating>, CRL, exticr2),
-    PD7: (pd7, 7, Input<Floating>, CRL, exticr2),
-    PD8: (pd8, 8, Input<Floating>, CRH, exticr3),
-    PD9: (pd9, 9, Input<Floating>, CRH, exticr3),
-    PD10: (pd10, 10, Input<Floating>, CRH, exticr3),
-    PD11: (pd11, 11, Input<Floating>, CRH, exticr3),
-    PD12: (pd12, 12, Input<Floating>, CRH, exticr4),
-    PD13: (pd13, 13, Input<Floating>, CRH, exticr4),
-    PD14: (pd14, 14, Input<Floating>, CRH, exticr4),
-    PD15: (pd15, 15, Input<Floating>, CRH, exticr4),
+gpio!(GPIOD, gpiod, 3, PDx, 3, [
+    PD0: (pd0, 0, Input<Floating>, exticr1),
+    PD1: (pd1, 1, Input<Floating>, exticr1),
+    PD2: (pd2, 2, Input<Floating>, exticr1),
+    PD3: (pd3, 3, Input<Floating>, exticr1),
+    PD4: (pd4, 4, Input<Floating>, exticr2),
+    PD5: (pd5, 5, Input<Floating>, exticr2),
+    PD6: (pd6, 6, Input<Floating>, exticr2),
+    PD7: (pd7, 7, Input<Floating>, exticr2),
+    PD8: (pd8, 8, Input<Floating>, exticr3),
+    PD9: (pd9, 9, Input<Floating>, exticr3),
+    PD10: (pd10, 10, Input<Floating>, exticr3),
+    PD11: (pd11, 11, Input<Floating>, exticr3),
+    PD12: (pd12, 12, Input<Floating>, exticr4),
+    PD13: (pd13, 13, Input<Floating>, exticr4),
+    PD14: (pd14, 14, Input<Floating>, exticr4),
+    PD15: (pd15, 15, Input<Floating>, exticr4),
 ]);
 
-gpio!(GPIOE, gpioe, gpioa, PEx, 4, [
-    PE0: (pe0, 0, Input<Floating>, CRL, exticr1),
-    PE1: (pe1, 1, Input<Floating>, CRL, exticr1),
-    PE2: (pe2, 2, Input<Floating>, CRL, exticr1),
-    PE3: (pe3, 3, Input<Floating>, CRL, exticr1),
-    PE4: (pe4, 4, Input<Floating>, CRL, exticr2),
-    PE5: (pe5, 5, Input<Floating>, CRL, exticr2),
-    PE6: (pe6, 6, Input<Floating>, CRL, exticr2),
-    PE7: (pe7, 7, Input<Floating>, CRL, exticr2),
-    PE8: (pe8, 8, Input<Floating>, CRH, exticr3),
-    PE9: (pe9, 9, Input<Floating>, CRH, exticr3),
-    PE10: (pe10, 10, Input<Floating>, CRH, exticr3),
-    PE11: (pe11, 11, Input<Floating>, CRH, exticr3),
-    PE12: (pe12, 12, Input<Floating>, CRH, exticr4),
-    PE13: (pe13, 13, Input<Floating>, CRH, exticr4),
-    PE14: (pe14, 14, Input<Floating>, CRH, exticr4),
-    PE15: (pe15, 15, Input<Floating>, CRH, exticr4),
+gpio!(GPIOE, gpioe, 4, PEx, 4, [
+    PE0: (pe0, 0, Input<Floating>, exticr1),
+    PE1: (pe1, 1, Input<Floating>, exticr1),
+    PE2: (pe2, 2, Input<Floating>, exticr1),
+    PE3: (pe3, 3, Input<Floating>, exticr1),
+    PE4: (pe4, 4, Input<Floating>, exticr2),
+    PE5: (pe5, 5, Input<Floating>, exticr2),
+    PE6: (pe6, 6, Input<Floating>, exticr2),
+    PE7: (pe7, 7, Input<Floating>, exticr2),
+    PE8: (pe8, 8, Input<Floating>, exticr3),
+    PE9: (pe9, 9, Input<Floating>, exticr3),
+    PE10: (pe10, 10, Input<Floating>, exticr3),
+    PE11: (pe11, 11, Input<Floating>, exticr3),
+    PE12: (pe12, 12, Input<Floating>, exticr4),
+    PE13: (pe13, 13, Input<Floating>, exticr4),
+    PE14: (pe14, 14, Input<Floating>, exticr4),
+    PE15: (pe15, 15, Input<Floating>, exticr4),
+]);
+
+gpio!(GPIOF, gpiof, 5, PFx, 5, [
+    PF0: (pf0, 0, Input<Floating>, exticr1),
+    PF1: (pf1, 1, Input<Floating>, exticr1),
+    PF2: (pf2, 2, Input<Floating>, exticr1),
+    PF3: (pf3, 3, Input<Floating>, exticr1),
+    PF4: (pf4, 4, Input<Floating>, exticr2),
+    PF5: (pf5, 5, Input<Floating>, exticr2),
+    PF6: (pf6, 6, Input<Floating>, exticr2),
+    PF7: (pf7, 7, Input<Floating>, exticr2),
+    PF8: (pf8, 8, Input<Floating>, exticr3),
+    PF9: (pf9, 9, Input<Floating>, exticr3),
+    PF10: (pf10, 10, Input<Floating>, exticr3),
+    PF11: (pf11, 11, Input<Floating>, exticr3),
+    PF12: (pf12, 12, Input<Floating>, exticr4),
+    PF13: (pf13, 13, Input<Floating>, exticr4),
+    PF14: (pf14, 14, Input<Floating>, exticr4),
+    PF15: (pf15, 15, Input<Floating>, exticr4),
+]);
+
+gpio!(GPIOG, gpiog, 6, PGx, 6, [
+    PG0: (pg0, 0, Input<Floating>, exticr1),
+    PG1: (pg1, 1, Input<Floating>, exticr1),
+    PG2: (pg2, 2, Input<Floating>, exticr1),
+    PG3: (pg3, 3, Input<Floating>, exticr1),
+    PG4: (pg4, 4, Input<Floating>, exticr2),
+    PG5: (pg5, 5, Input<Floating>, exticr2),
+    PG6: (pg6, 6, Input<Floating>, exticr2),
+    PG7: (pg7, 7, Input<Floating>, exticr2),
+    PG8: (pg8, 8, Input<Floating>, exticr3),
+    PG9: (pg9, 9, Input<Floating>, exticr3),
+    PG10: (pg10, 10, Input<Floating>, exticr3),
+    PG11: (pg11, 11, Input<Floating>, exticr3),
+    PG12: (pg12, 12, Input<Floating>, exticr4),
+    PG13: (pg13, 13, Input<Floating>, exticr4),
+    PG14: (pg14, 14, Input<Floating>, exticr4),
+    PG15: (pg15, 15, Input<Floating>, exticr4),
+]);
+
+gpio!(GPIOH, gpioh, 7, PHx, 7, [
+    PH0: (ph0, 0, Input<Floating>, exticr1),
+    PH1: (ph1, 1, Input<Floating>, exticr1),
+    PH2: (ph2, 2, Input<Floating>, exticr1),
+    PH3: (ph3, 3, Input<Floating>, exticr1),
+    PH4: (ph4, 4, Input<Floating>, exticr2),
+    PH5: (ph5, 5, Input<Floating>, exticr2),
+    PH6: (ph6, 6, Input<Floating>, exticr2),
+    PH7: (ph7, 7, Input<Floating>, exticr2),
+    PH8: (ph8, 8, Input<Floating>, exticr3),
+    PH9: (ph9, 9, Input<Floating>, exticr3),
+    PH10: (ph10, 10, Input<Floating>, exticr3),
+    PH11: (ph11, 11, Input<Floating>, exticr3),
+    PH12: (ph12, 12, Input<Floating>, exticr4),
+    PH13: (ph13, 13, Input<Floating>, exticr4),
+    PH14: (ph14, 14, Input<Floating>, exticr4),
+    PH15: (ph15, 15, Input<Floating>, exticr4),
+]);
+
+gpio!(GPIOI, gpioi, 8, PIx, 8, [
+    PI0: (pi0, 0, Input<Floating>, exticr1),
+    PI1: (pi1, 1, Input<Floating>, exticr1),
+    PI2: (pi2, 2, Input<Floating>, exticr1),
+    PI3: (pi3, 3, Input<Floating>, exticr1),
+    PI4: (pi4, 4, Input<Floating>, exticr2),
+    PI5: (pi5, 5, Input<Floating>, exticr2),
+    PI6: (pi6, 6, Input<Floating>, exticr2),
+    PI7: (pi7, 7, Input<Floating>, exticr2),
+    PI8: (pi8, 8, Input<Floating>, exticr3),
+    PI9: (pi9, 9, Input<Floating>, exticr3),
+    PI10: (pi10, 10, Input<Floating>, exticr3),
+    PI11: (pi11, 11, Input<Floating>, exticr3),
+    PI12: (pi12, 12, Input<Floating>, exticr4),
+    PI13: (pi13, 13, Input<Floating>, exticr4),
+    PI14: (pi14, 14, Input<Floating>, exticr4),
+    PI15: (pi15, 15, Input<Floating>, exticr4),
+]);
+
+gpio!(GPIOJ, gpioj, 9, PJx, 9, [
+    PJ0: (pj0, 0, Input<Floating>, exticr1),
+    PJ1: (pj1, 1, Input<Floating>, exticr1),
+    PJ2: (pj2, 2, Input<Floating>, exticr1),
+    PJ3: (pj3, 3, Input<Floating>, exticr1),
+    PJ4: (pj4, 4, Input<Floating>, exticr2),
+    PJ5: (pj5, 5, Input<Floating>, exticr2),
+    PJ6: (pj6, 6, Input<Floating>, exticr2),
+    PJ7: (pj7, 7, Input<Floating>, exticr2),
+    PJ8: (pj8, 8, Input<Floating>, exticr3),
+    PJ9: (pj9, 9, Input<Floating>, exticr3),
+    PJ10: (pj10, 10, Input<Floating>, exticr3),
+    PJ11: (pj11, 11, Input<Floating>, exticr3),
+    PJ12: (pj12, 12, Input<Floating>, exticr4),
+    PJ13: (pj13, 13, Input<Floating>, exticr4),
+    PJ14: (pj14, 14, Input<Floating>, exticr4),
+    PJ15: (pj15, 15, Input<Floating>, exticr4),
+]);
+
+gpio!(GPIOK, gpiok, 10, PKx, 10, [
+    PK0: (pk0, 0, Input<Floating>, exticr1),
+    PK1: (pk1, 1, Input<Floating>, exticr1),
+    PK2: (pk2, 2, Input<Floating>, exticr1),
+    PK3: (pk3, 3, Input<Floating>, exticr1),
+    PK4: (pk4, 4, Input<Floating>, exticr2),
+    PK5: (pk5, 5, Input<Floating>, exticr2),
+    PK6: (pk6, 6, Input<Floating>, exticr2),
+    PK7: (pk7, 7, Input<Floating>, exticr2),
 ]);

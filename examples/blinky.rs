@@ -1,52 +1,90 @@
-//! Blinks an LED
-//!
-//! This assumes that a LED is connected to pc13 as is the case on the blue pill board.
-//!
-//! Note: Without additional hardware, PC13 should not be used to drive an LED, see page 5.1.2 of
-//! the reference manual for an explanation. This is not an issue on the blue pill.
-
-#![deny(unsafe_code)]
-#![no_std]
+#![feature(asm)]
 #![no_main]
+#![no_std]
 
 use panic_halt as _;
 
-use nb::block;
-
 use cortex_m_rt::entry;
-use embedded_hal::digital::v2::OutputPin;
-use stm32f1xx_hal::{pac, prelude::*, timer::Timer};
+use stm32mp1xx_hal as hal;
+use pac::interrupt;
+
+use hal::{prelude::*, gpio::*, pac};
+use core::mem::MaybeUninit;
+use heapless::Vec;
+use heapless::consts::*;
+use core::borrow::BorrowMut;
+use usb_device::endpoint::EndpointType::Interrupt;
+
+static mut LED_RED: MaybeUninit<crate::hal::gpio::Pxx<Output<PushPull>>> = MaybeUninit::uninit();
+static mut BTN: MaybeUninit<crate::hal::gpio::Pxx<Input<PullUp>>> = MaybeUninit::uninit();
+
+#[interrupt]
+fn EXTI1() {
+    let led_red = unsafe { &mut *LED_RED.as_mut_ptr() };
+    led_red.set_high().unwrap();
+
+    let btn = unsafe { &mut *BTN.as_mut_ptr() };
+    if btn.check_interrupt(Edge::FALLING) {
+        btn.clear_interrupt_pending_bit(Edge::FALLING);
+    }
+}
 
 #[entry]
 fn main() -> ! {
-    // Get access to the core peripherals from the cortex-m crate
-    let cp = cortex_m::Peripherals::take().unwrap();
-    // Get access to the device specific peripherals from the peripheral access crate
-    let dp = pac::Peripherals::take().unwrap();
+    let mut cp = cortex_m::peripheral::Peripherals::take().unwrap();
+    let mut dp = pac::Peripherals::take().unwrap();
 
-    // Take ownership over the raw flash and rcc devices and convert them into the corresponding
-    // HAL structs
-    let mut flash = dp.FLASH.constrain();
-    let mut rcc = dp.RCC.constrain();
+    // let mut vec = Vec::<_, U3>::new();
 
-    // Freeze the configuration of all the clocks in the system and store the frozen frequencies in
-    // `clocks`
-    let clocks = rcc.cfgr.freeze(&mut flash.acr);
+    let gpioa = dp.GPIOA.split();
+    let gpiob = dp.GPIOB.split();
+    let gpiog = dp.GPIOG.split();
 
-    // Acquire the GPIOC peripheral
-    let mut gpioc = dp.GPIOC.split(&mut rcc.apb2);
+    let mut led_red = unsafe { &mut *LED_RED.as_mut_ptr() };
+    *led_red = gpiog.pg13.into_push_pull_output().downgrade();
+    // led_red = gpiog.pg13.into_push_pull_output().downgrade();
+    let mut led_green = gpiob.pb13.into_push_pull_output().downgrade();
+    let mut led_blue = gpioa.pa3.into_push_pull_output().downgrade();
 
-    // Configure gpio C pin 13 as a push-pull output. The `crh` register is passed to the function
-    // in order to configure the port. For pins 0-7, crl should be passed instead.
-    let mut led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
-    // Configure the syst timer to trigger an update every second
-    let mut timer = Timer::syst(cp.SYST, &clocks).start_count_down(1.hz());
+    // vec.push(led_red).unwrap_or(());
+    // vec.push(&mut led_green).unwrap_or(());
+    // vec.push(&mut led_blue).unwrap_or(());
 
-    // Wait for the timer to trigger an update and change the state of the LED
+    // let btn = unsafe { &mut *BTN.as_mut_ptr() };
+    let mut btn = gpiog.pg1.into_floating_input();
+    btn.make_interrupt_source(&mut dp.EXTI);
+    btn.trigger_on_edge(&mut dp.EXTI, Edge::RISING_FALLING);
+    btn.enable_interrupt(&mut dp.EXTI);
+
+    unsafe {
+        dp.RCC.mc_ahb3ensetr
+            .write(|w|
+                w
+                    .hsemen().set_bit()
+            );
+        cp.NVIC.set_priority(pac::Interrupt::EXTI1, 6);
+        pac::NVIC::unmask(pac::Interrupt::EXTI1);
+    };
+
+    // Set all LEDs low
+    // for led in &mut vec {
+    //     led.set_low().unwrap();
+    // }
+
+    fn wait() {
+        for _ in 0..48_000 {
+            unsafe { asm!("nop;"); }
+        }
+    }
+
     loop {
-        block!(timer.wait()).unwrap();
-        led.set_high().unwrap();
-        block!(timer.wait()).unwrap();
-        led.set_low().unwrap();
+        if btn.is_low().unwrap() {
+            led_green.set_high().unwrap();
+            wait();
+            led_green.set_low().unwrap();
+            wait();
+        }
     }
 }
+
+
